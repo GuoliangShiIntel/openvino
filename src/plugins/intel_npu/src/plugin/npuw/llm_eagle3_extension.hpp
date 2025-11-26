@@ -23,11 +23,13 @@ struct Eagle3LayerNames {
     static constexpr const char* hidden_states = "hidden_states";
     static constexpr const char* internal_hidden_states = "internal_hidden_states";
     static constexpr const char* last_hidden_state = "last_hidden_state";
+    static constexpr const char* eagle_tree_mask = "eagle_tree_mask";
 };
 
 // Utility functions for Eagle3 layer name matching
 bool matchEagle3HiddenStatesString(const std::string& input);
 bool matchEagle3InternalHiddenStatesString(const std::string& input);
+bool matchEagle3TreeMaskString(const std::string& input);
 
 // Model roles for Eagle3 speculative decoding
 enum class Eagle3ModelRole {
@@ -54,31 +56,39 @@ public:
         return m_role;
     }
 
-    // Store user-provided Eagle3 input tensors (for draft models only)
+    // Store user-provided Eagle3 input tensors
     template <typename GetTensorFunc>
     bool store_user_tensors(const std::vector<ov::Output<const ov::Node>>& inputs, GetTensorFunc get_tensor_func) {
-        if (m_role != Eagle3ModelRole::Draft) {
-            return false;
-        }
-
         bool processed_any = false;
 
-        // Process internal_hidden_states input
-        auto internal_hidden_port = find_port_by_name(inputs, Eagle3LayerNames::internal_hidden_states);
-        if (internal_hidden_port.has_value()) {
-            auto tensor = get_tensor_func(internal_hidden_port.value());
-            validate_hidden_state_tensor(tensor, "internal_hidden_states");
-            m_internal_hidden_states = tensor;
+        // Process eagle_tree_mask input (both Draft and Target models)
+        auto tree_mask_port = find_port_by_name(inputs, Eagle3LayerNames::eagle_tree_mask);
+        if (tree_mask_port.has_value()) {
+            auto tensor = get_tensor_func(tree_mask_port.value());
+            validate_tree_mask_tensor(tensor, "eagle_tree_mask");
+            m_eagle_tree_mask = tensor;
             processed_any = true;
         }
 
-        // Process hidden_states input
-        auto hidden_port = find_port_by_name(inputs, Eagle3LayerNames::hidden_states);
-        if (hidden_port.has_value()) {
-            auto tensor = get_tensor_func(hidden_port.value());
-            validate_hidden_state_tensor(tensor, "hidden_states");
-            m_hidden_states = tensor;
-            processed_any = true;
+        // Draft model specific inputs
+        if (m_role == Eagle3ModelRole::Draft) {
+            // Process internal_hidden_states input
+            auto internal_hidden_port = find_port_by_name(inputs, Eagle3LayerNames::internal_hidden_states);
+            if (internal_hidden_port.has_value()) {
+                auto tensor = get_tensor_func(internal_hidden_port.value());
+                validate_hidden_state_tensor(tensor, "internal_hidden_states");
+                m_internal_hidden_states = tensor;
+                processed_any = true;
+            }
+
+            // Process hidden_states input
+            auto hidden_port = find_port_by_name(inputs, Eagle3LayerNames::hidden_states);
+            if (hidden_port.has_value()) {
+                auto tensor = get_tensor_func(hidden_port.value());
+                validate_hidden_state_tensor(tensor, "hidden_states");
+                m_hidden_states = tensor;
+                processed_any = true;
+            }
         }
 
         return processed_any;
@@ -110,6 +120,10 @@ public:
         return m_last_hidden_state;
     }
 
+    ov::SoPtr<ov::ITensor> get_eagle_tree_mask() const {
+        return m_eagle_tree_mask;
+    }
+
 private:
     static std::optional<ov::Output<const ov::Node>> find_port_by_name(
         const std::vector<ov::Output<const ov::Node>>& ports,
@@ -121,11 +135,13 @@ private:
     }
 
     void validate_hidden_state_tensor(const ov::SoPtr<ov::ITensor>& tensor, const std::string& name);
+    void validate_tree_mask_tensor(const ov::SoPtr<ov::ITensor>& tensor, const std::string& name);
 
     Eagle3ModelRole m_role = Eagle3ModelRole::None;
 
     ov::SoPtr<ov::ITensor> m_hidden_states;           ///< Draft model input: hidden_states
     ov::SoPtr<ov::ITensor> m_internal_hidden_states;  ///< Draft model input: internal_hidden_states
+    ov::SoPtr<ov::ITensor> m_eagle_tree_mask;         ///< Draft/Target model input: eagle_tree_mask
     ov::SoPtr<ov::ITensor> m_last_hidden_state;       ///< Draft/Target model output: last_hidden_state
 };
 

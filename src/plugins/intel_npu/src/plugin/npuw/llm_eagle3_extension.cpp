@@ -21,11 +21,24 @@ bool matchEagle3InternalHiddenStatesString(const std::string& input) {
     return input == Eagle3LayerNames::internal_hidden_states;
 }
 
+bool matchEagle3TreeMaskString(const std::string& input) {
+    return input == Eagle3LayerNames::eagle_tree_mask;
+}
+
 void Eagle3Extension::validate_hidden_state_tensor(const ov::SoPtr<ov::ITensor>& tensor, const std::string& name) {
     OPENVINO_ASSERT(ov::element::f32 == tensor->get_element_type() || ov::element::f16 == tensor->get_element_type(),
                     name + " input must be float32 or float16");
     OPENVINO_ASSERT(tensor->get_shape().size() == 3,
                     name + " input must have 3 dimensions: [batch, token_length, embedding_size]");
+}
+
+void Eagle3Extension::validate_tree_mask_tensor(const ov::SoPtr<ov::ITensor>& tensor, const std::string& name) {
+    OPENVINO_ASSERT(ov::element::f32 == tensor->get_element_type() || ov::element::f16 == tensor->get_element_type(),
+                    name + " input must be float32 or float16");
+    OPENVINO_ASSERT(tensor->get_shape().size() == 4,
+                    name + " input must have 4 dimensions: [batch, 1, seq_len, seq_len]");
+    OPENVINO_ASSERT(tensor->get_shape()[0] == 1, name + " input batch dimension must be 1");
+    OPENVINO_ASSERT(tensor->get_shape()[1] == 1, name + " input second dimension must be 1");
 }
 
 }  // namespace npuw
@@ -72,6 +85,59 @@ void pad_hidden_state_input(const ov::SoPtr<ov::ITensor>& padded_hidden_state,
     std::memcpy(dst_data + padding_bytes, src_data, input_bytes);
 }
 
+void pad_tree_mask_input(const ov::SoPtr<ov::ITensor>& padded_tree_mask, const ov::SoPtr<ov::ITensor>& tree_mask) {
+    // Pad the tree mask tensor [batch, 1, input_size, kvcache_size]
+    // Two scenarios:
+    // 1. Prefill phase: user provides small mask, model expects {1, 1, 1, 1}
+    // 2. Generate phase: user provides full mask, model expects {1, 1, input_size, kvcache_size}
+    // Padding is applied to dimensions 2 and 3 (seq_len dimensions)
+    auto padded_shape = padded_tree_mask->get_shape();
+    auto tree_mask_shape = tree_mask->get_shape();
+
+    OPENVINO_ASSERT(tree_mask_shape.size() == 4,
+                    "Tree mask input should have 4 dimensions: [batch, 1, input_size, kvcache_size]");
+    OPENVINO_ASSERT(padded_shape.size() == 4,
+                    "Padded tree mask should have 4 dimensions: [batch, 1, input_size, kvcache_size]");
+
+    OPENVINO_ASSERT(tree_mask_shape[0] == 1, "Batch size must be 1 for Eagle3 tree mask");
+    OPENVINO_ASSERT(padded_shape[0] == 1, "Padded batch size must be 1 for Eagle3 tree mask");
+    OPENVINO_ASSERT(tree_mask_shape[1] == 1, "Second dimension must be 1 for Eagle3 tree mask");
+    OPENVINO_ASSERT(padded_shape[1] == 1, "Padded second dimension must be 1 for Eagle3 tree mask");
+
+    OPENVINO_ASSERT(padded_shape[2] >= tree_mask_shape[2], "Padded input_size must be >= original input_size");
+    OPENVINO_ASSERT(padded_shape[3] >= tree_mask_shape[3], "Padded kvcache_size must be >= original kvcache_size");
+
+    const size_t input_size = tree_mask_shape[2];
+    const size_t padded_input_size = padded_shape[2];
+    const size_t kvcache_size = tree_mask_shape[3];
+    const size_t padded_kvcache_size = padded_shape[3];
+    const size_t elem_size = tree_mask->get_element_type().size();
+
+    // Fast path: if shapes match exactly, just copy
+    if (padded_shape == tree_mask_shape) {
+        std::memcpy(padded_tree_mask->data(), tree_mask->data(), tree_mask->get_byte_size());
+        return;
+    }
+
+    // Get raw data pointers
+    const uint8_t* src_data = reinterpret_cast<const uint8_t*>(tree_mask->data());
+    uint8_t* dst_data = reinterpret_cast<uint8_t*>(padded_tree_mask->data());
+
+    // Zero-fill the entire padded tensor first
+    std::memset(dst_data, 0, padded_tree_mask->get_byte_size());
+
+    // Copy each row of the original tensor to the padded tensor
+    // Left-pad both dimensions (top-left corner is padding, bottom-right is data)
+    const size_t row_padding = padded_input_size - input_size;
+    const size_t col_padding = padded_kvcache_size - kvcache_size;
+
+    for (size_t i = 0; i < input_size; ++i) {
+        const uint8_t* src_row = src_data + i * kvcache_size * elem_size;
+        uint8_t* dst_row = dst_data + (i + row_padding) * padded_kvcache_size * elem_size + col_padding * elem_size;
+        std::memcpy(dst_row, src_row, kvcache_size * elem_size);
+    }
+}
+
 }  // anonymous namespace
 
 namespace ov {
@@ -94,14 +160,15 @@ void Eagle3Extension::initialize(const ov::AnyMap& rt_info,
     // It's an Eagle3 model, now determine if it's Draft or Target based on inputs/outputs
     bool has_hidden_states_input = in_ports.find(Eagle3LayerNames::hidden_states) != in_ports.end();
     bool has_internal_hidden_states_input = in_ports.find(Eagle3LayerNames::internal_hidden_states) != in_ports.end();
+    bool has_eagle_tree_mask_input = in_ports.find(Eagle3LayerNames::eagle_tree_mask) != in_ports.end();
     bool has_last_hidden_state_output = out_ports.find(Eagle3LayerNames::last_hidden_state) != out_ports.end();
 
     if (has_hidden_states_input && has_internal_hidden_states_input && has_last_hidden_state_output) {
         m_role = Eagle3ModelRole::Draft;
-        LOG_INFO("Eagle3 Draft Model detected");
+        LOG_INFO("Eagle3 Draft Model detected" << (has_eagle_tree_mask_input ? " (with eagle_tree_mask)" : ""));
     } else if (!has_hidden_states_input && !has_internal_hidden_states_input && has_last_hidden_state_output) {
         m_role = Eagle3ModelRole::Target;
-        LOG_INFO("Eagle3 Target Model detected");
+        LOG_INFO("Eagle3 Target Model detected" << (has_eagle_tree_mask_input ? " (with eagle_tree_mask)" : ""));
     } else {
         m_role = Eagle3ModelRole::None;
         LOG_WARN("Eagle3 model flag set in rt_info, but model structure doesn't match Draft or Target pattern");
@@ -110,7 +177,15 @@ void Eagle3Extension::initialize(const ov::AnyMap& rt_info,
 
 void Eagle3Extension::prepare_inputs(std::shared_ptr<ov::IAsyncInferRequest> request,
                                      const std::unordered_map<std::string, ov::Output<const ov::Node>>& in_ports) {
-    // Only draft models need to prepare Eagle3 inputs
+    // Set eagle_tree_mask for both Draft and Target models
+    auto tree_mask_it = in_ports.find(Eagle3LayerNames::eagle_tree_mask);
+    if (tree_mask_it != in_ports.end() && m_eagle_tree_mask) {
+        auto padded_tree_mask = request->get_tensor(tree_mask_it->second);
+        pad_tree_mask_input(padded_tree_mask, m_eagle_tree_mask);
+        LOG_VERB("Eagle3: Set eagle_tree_mask input tensor");
+    }
+
+    // Only draft models need to prepare hidden state inputs
     if (m_role != Eagle3ModelRole::Draft) {
         return;
     }
@@ -148,7 +223,15 @@ void Eagle3Extension::prepare_inputs_for_chunk(
     const std::unordered_map<std::string, ov::Output<const ov::Node>>& in_ports,
     uint32_t chunk_start_token,
     uint32_t chunk_token_count) {
-    // Only draft models need chunk-specific input preparation
+    // Set eagle_tree_mask for both Draft and Target models (same for all chunks)
+    auto tree_mask_it = in_ports.find(Eagle3LayerNames::eagle_tree_mask);
+    if (tree_mask_it != in_ports.end() && m_eagle_tree_mask) {
+        auto padded_tree_mask = request->get_tensor(tree_mask_it->second);
+        pad_tree_mask_input(padded_tree_mask, m_eagle_tree_mask);
+        LOG_VERB("Eagle3 Chunk: Set eagle_tree_mask input tensor");
+    }
+
+    // Only draft models need chunk-specific hidden state input preparation
     if (m_role != Eagle3ModelRole::Draft) {
         return;
     }
