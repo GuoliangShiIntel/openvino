@@ -921,7 +921,8 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         // Use min(global_context_length, layer_bound_kv_length) to satisfy both constraints:
                         // 1) Global layers: do not exceed real conversation length when block capacity is rounded up.
                         // 2) SWA layers: do not exceed KV that is actually bound in layer tensors.
-                        int64_t layer_bound_kv_length = static_cast<int64_t>(present_key_tensor->get_shape()[K_SEQ_DIM]);
+                        int64_t layer_bound_kv_length =
+                            static_cast<int64_t>(present_key_tensor->get_shape()[K_SEQ_DIM]);
                         for (const auto& k_block : past_key_blocks) {
                             layer_bound_kv_length += static_cast<int64_t>(k_block->get_shape()[K_SEQ_DIM]);
                         }
