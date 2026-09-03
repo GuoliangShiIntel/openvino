@@ -28,8 +28,9 @@ namespace ov::npuw {
 // therefore fails before any node is modified.
 //
 // SWA contract:
-// - new_past = window_size
-// - new_kv_total = input_size + window_size
+// - prefill:  new_past = window_size
+// - generate: new_past = max(window_size - input_size, 0)
+// - new_kv_total = input_size + new_past
 //
 // Pass ordering:
 // - Run after ReshapeToStatic.
@@ -41,13 +42,15 @@ class ShrinkSlidingWindowKVCache : public ov::pass::ModelPass {
     uint32_t m_kvcache_size;
     uint32_t m_input_size;
     KVAxesPosition m_kv_axes_position;
+    bool m_is_prefill;
 
 public:
     OPENVINO_MODEL_PASS_RTTI("ov::npuw::ShrinkSlidingWindowKVCache");
     ShrinkSlidingWindowKVCache(ov::npuw::util::SwaLayout swa_layout,
                                uint32_t kvcache_size,
                                uint32_t input_size,
-                               const KVAxesPosition& kv_axes_position);
+                               const KVAxesPosition& kv_axes_position,
+                               bool is_prefill);
     bool run_on_model(const std::shared_ptr<ov::Model>& model) override;
 };
 

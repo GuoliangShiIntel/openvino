@@ -680,7 +680,7 @@ std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::create_gener
         if (m_swa_layout.enabled()) {
             LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to generate variant (kv_size=" << kv_size
                                                                                                        << ").");
-            ov::npuw::ShrinkSlidingWindowKVCache(m_swa_layout, kv_size, max_generation_token_len, axes)
+            ov::npuw::ShrinkSlidingWindowKVCache(m_swa_layout, kv_size, max_generation_token_len, axes, false)
                 .run_on_model(generate_variant);
         }
 
@@ -1031,7 +1031,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
     if (m_swa_layout.enabled()) {
         LOG_DEBUG("[SWA] Applying sliding-window KV-cache reduction to prefill model.");
-        ov::npuw::ShrinkSlidingWindowKVCache(m_swa_layout, m_kvcache_desc.max_prompt_size, prefill_input_size, axes)
+        ov::npuw::ShrinkSlidingWindowKVCache(m_swa_layout,
+                                             m_kvcache_desc.max_prompt_size,
+                                             prefill_input_size,
+                                             axes,
+                                             true)
             .run_on_model(prefill_model);
     }
     LOG_DEBUG("Make kvcache model with static shapes");

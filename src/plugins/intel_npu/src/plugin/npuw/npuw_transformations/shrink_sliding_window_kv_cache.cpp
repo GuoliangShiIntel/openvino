@@ -391,11 +391,13 @@ namespace ov::npuw {
 ShrinkSlidingWindowKVCache::ShrinkSlidingWindowKVCache(ov::npuw::util::SwaLayout swa_layout,
                                                        uint32_t kvcache_size,
                                                        uint32_t input_size,
-                                                       const KVAxesPosition& kv_axes_position)
+                                                       const KVAxesPosition& kv_axes_position,
+                                                       bool is_prefill)
     : m_swa_layout(std::move(swa_layout)),
       m_kvcache_size(kvcache_size),
       m_input_size(input_size),
-      m_kv_axes_position(kv_axes_position) {}
+      m_kv_axes_position(kv_axes_position),
+      m_is_prefill(is_prefill) {}
 
 bool ShrinkSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& model) {
     if (!m_swa_layout.enabled() || m_swa_layout.layer_is_sliding.empty()) {
@@ -412,13 +414,16 @@ bool ShrinkSlidingWindowKVCache::run_on_model(const std::shared_ptr<ov::Model>& 
                     ") must be <= available_past (kvcache_size - input_size = ",
                     available_past,
                     ").");
-    const int64_t new_past = available_past == 0 ? 0 : static_cast<int64_t>(m_swa_layout.window_size);
+    const uint32_t stage_new_past =
+        m_is_prefill ? m_swa_layout.window_size
+                     : (m_swa_layout.window_size > m_input_size ? (m_swa_layout.window_size - m_input_size) : 0u);
+    const int64_t new_past = available_past == 0 ? 0 : static_cast<int64_t>(stage_new_past);
     const int64_t new_kv_total = static_cast<int64_t>(m_input_size) + new_past;
 
     LOG_INFO("[SWA] ShrinkSlidingWindowKVCache: model='"
              << model->get_friendly_name() << "' kvcache=" << m_kvcache_size << " input=" << m_input_size
-             << " window=" << m_swa_layout.window_size << " new_past=" << new_past << " new_kv_total=" << new_kv_total
-             << " sliding_layers="
+             << " stage=" << (m_is_prefill ? "prefill" : "generate") << " window=" << m_swa_layout.window_size
+             << " new_past=" << new_past << " new_kv_total=" << new_kv_total << " sliding_layers="
              << std::count(m_swa_layout.layer_is_sliding.begin(), m_swa_layout.layer_is_sliding.end(), true));
 
     const size_t seq_len_axis = static_cast<size_t>(m_kv_axes_position.seq_len);

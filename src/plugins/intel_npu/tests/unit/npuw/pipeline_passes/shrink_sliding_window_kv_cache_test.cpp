@@ -108,7 +108,7 @@ TEST_F(ShrinkSlidingWindowKVCacheTest, GenerateModel_OnlySlidingLayersPastKVShru
     // Default props: kvcache_size=192, generate input_size=1 => full past=191.
     const auto sliding_past = input_shape(generate.model, "past_key_values.0.key");
     ASSERT_TRUE(sliding_past.has_value()) << "past_key_values.0.key not found in generate model";
-    EXPECT_EQ((*sliding_past)[2], kWindowSize);
+    EXPECT_EQ((*sliding_past)[2], kWindowSize - 1);
 
     const auto full_past = input_shape(generate.model, "past_key_values.1.key");
     ASSERT_TRUE(full_past.has_value()) << "past_key_values.1.key not found in generate model";
@@ -127,8 +127,8 @@ TEST_F(ShrinkSlidingWindowKVCacheTest, GenerateModel_SlidingMaskWidthShrunkToNew
     const auto mask_shape = input_shape(generate.model, "sliding_window_attention_mask");
     ASSERT_TRUE(mask_shape.has_value()) << "sliding_window_attention_mask not found in generate model";
 
-    // Generate input_size=1, window=32 => new_kv_total=33.
-    EXPECT_EQ(mask_shape->back(), 33u);
+    // Generate input_size=1, window=32 => new_kv_total=32.
+    EXPECT_EQ(mask_shape->back(), 32u);
 }
 
 // Prefill invariant: sliding mask width follows the same post-concat KV width rule.
@@ -202,7 +202,8 @@ TEST_F(ShrinkSlidingWindowKVCacheTest, GenerateModel_SlidingSDPAUsesExternalized
 }
 
 // With default prefill hint and chunk size equal to max prompt length,
-// prefill drops empty past KV inputs while generate keeps window-sized past; both externalize SWA mask.
+// prefill drops empty past KV inputs while generate keeps (window-1)-sized past for input_size=1;
+// both externalize SWA mask.
 TEST_F(ShrinkSlidingWindowKVCacheTest, PrefillAndGenerate_ExpectedPastAndMaskBehaviorForPromptAndTotalKv) {
     RecordingFactory recorder;
     std::unique_ptr<ov::npuw::LLMCompiledModel> compiled;
@@ -232,11 +233,11 @@ TEST_F(ShrinkSlidingWindowKVCacheTest, PrefillAndGenerate_ExpectedPastAndMaskBeh
 
     const auto generate_sliding_past = input_shape(generate.model, "past_key_values.0.key");
     ASSERT_TRUE(generate_sliding_past.has_value()) << "past_key_values.0.key not found in generate model";
-    EXPECT_EQ((*generate_sliding_past)[2], kWindowSize);
+    EXPECT_EQ((*generate_sliding_past)[2], kWindowSize - 1);
 
     EXPECT_EQ(prefill_mask_shape->back(), input_ids_shape->back());
     EXPECT_EQ(prefill_mask_shape->back(), 128u);
-    EXPECT_EQ(generate_mask_shape->back(), 33u);
+    EXPECT_EQ(generate_mask_shape->back(), 32u);
 }
 
 // Shape-privatization invariant: KV target-shape constants that carried the full kvcache
@@ -252,8 +253,8 @@ TEST_F(ShrinkSlidingWindowKVCacheTest, GenerateModel_SlidingKVShapeConstantsPatc
 
     const auto& generate = require_sub_model_containing(recorder, "_kv");
 
-    // Generate input_size=1, window=32 => new_kv_total=33.
-    constexpr int64_t kNewKvTotal = 33;
+    // Generate input_size=1, window=32 => new_kv_total=32.
+    constexpr int64_t kNewKvTotal = 32;
     std::size_t num_patched = 0;
     for (const auto& op : generate.model->get_ordered_ops()) {
         auto constant = ov::as_type_ptr<ov::op::v0::Constant>(op);
