@@ -187,8 +187,8 @@ void ensure_hfa_selector(ov::npuw::v1::subgraphs::InferContext& ctx, RuntimeStat
     OPENVINO_ASSERT(hfa != nullptr, "Missing compiled HFA state");
 
     auto& request = get_request(ctx);
-    const size_t query_size = hfa->_sdpa_attention_info._query_size;
-    state.hfa_selector = runtime::host_flash_attention::PositionIDs::find(query_size, request);
+    const size_t original_query_length = hfa->_sdpa_attention_info._query_size;
+    state.hfa_selector = runtime::host_flash_attention::PositionIDs::find(original_query_length, request);
     if (!state.hfa_selector) {
         OPENVINO_THROW("HFA dynamic capability is enabled, but no run-time features were found.");
     }
@@ -1078,15 +1078,16 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                 }
                             }
 
-                            if (async) {
-                                request->start_async();
-                                if (state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {
-                                    state.hfa_runtime_ctx->prepare_next_state_buffers();
-                                }
-                                request->wait();
-                            } else {
-                                request->infer();
+                            // Always submit through the async entry: a tile model compiled
+                            // with RUN_INFERENCES_SEQUENTIALLY rejects infer(), and
+                            // start_async() plus wait() is the same work. The async flag
+                            // now only decides whether the next state buffers are prepared
+                            // while the tile runs.
+                            request->start_async();
+                            if (async && state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {
+                                state.hfa_runtime_ctx->prepare_next_state_buffers();
                             }
+                            request->wait();
                         };
 
                         int64_t mask_tile_offset = 0;

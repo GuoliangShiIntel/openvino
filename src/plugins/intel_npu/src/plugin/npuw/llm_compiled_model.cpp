@@ -22,6 +22,7 @@
 #include "npuw_transformations/lora_stateful_to_stateless.hpp"
 #include "npuw_transformations/optimize_value_tensors.hpp"
 #include "npuw_transformations/patch_sliding_window_mask.hpp"
+#include "npuw_transformations/propagate_slice.hpp"
 #include "npuw_transformations/remove_token_type_ids.hpp"
 #include "npuw_transformations/replace_deepstack_scatter_with_add.hpp"
 #include "npuw_transformations/reshape_sliced_head_to_static.hpp"
@@ -574,9 +575,8 @@ void apply_moe_config(ov::AnyMap& stage_config,
         }
     } else if (moe_hint == ::intel_npu::npuw::llm::MoEHint::DEVICE_ROUTED) {
         if (stage_name == "PREFILL") {
-            NPUW_ASSERT(false && "MoE DEVICE_ROUTED is not supported for PREFILL stage. "
-                                 "DEVICE_ROUTED mode uses in-graph gather-based expert selection which is only "
-                                 "optimized for GENERATE stage. Please use HOST_ROUTED or DENSE for PREFILL.");
+            LOG_INFO("MoE config for PREFILL stage: DEVICE_ROUTED (raw block -> compiler MOE-op fusion)");
+            stage_config["NPUW_ONLINE_PIPELINE"] = "REP";
         }
         stage_config["NPUW_UNFOLD_IREQS"] = "YES";
     } else if (moe_hint == ::intel_npu::npuw::llm::MoEHint::DENSE) {
@@ -1047,11 +1047,25 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Encoder embedding model: skipping generate model variants (prefill-only).");
     }
 
+    const bool is_per_layer_inputs_model = has_per_layer_inputs(prefill_model);
+    bool propagate_slice_up = m_cfg.get<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>();
+
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
         // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
         // so only apply slice to the Prefill model:
         ov::npuw::SliceOutEmbeds(axes.batch, m_kvcache_desc.max_generation_token_len).run_on_model(prefill_model);
+        // Gemma-4 E2B/E4B cross-group KV sharing models benefit the most from hoisting the slice
+        // through the SWA/Global boundary, so auto-enable this option for them unless the user
+        // explicitly configured it.
+        if (is_per_layer_inputs_model && !m_cfg.has<::intel_npu::NPUW_LLM_PROPAGATE_SLICE_UP>()) {
+            m_cfg.update({{"NPUW_LLM_PROPAGATE_SLICE_UP", "YES"}});
+            propagate_slice_up = true;
+            LOG_INFO("Gemma-4 cross-group KV model: auto-enabling NPUW_LLM_PROPAGATE_SLICE_UP");
+        }
+        if (propagate_slice_up) {
+            ov::npuw::PropagateSliceUp().run_on_model(prefill_model);
+        }
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
@@ -1205,8 +1219,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         // Both variants fall below the default keep_blocks=5 threshold and remain as
         // separate FCE compile units.  Lower to 3 so both are folded into REP and
         // reused across their respective instances.
-        if (has_per_layer_inputs(prefill_model)) {
+        if (is_per_layer_inputs_model) {
             prefill_config["NPUW_ONLINE_KEEP_BLOCKS"] = "3";
+            if (propagate_slice_up) {
+                prefill_config["NPUW_ONLINE_KEEP_BLOCKS_TAGGED"] = "attn";
+            }
             LOG_INFO("Gemma-4 cross-group KV model: setting NPUW_ONLINE_KEEP_BLOCKS=3 for prefill");
         }
     }
@@ -1963,6 +1980,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::llm::prefill_attn_hint, NPUW_LLM_PREFILL_ATTENTION_HINT, getString),
                           BIND(npuw::llm::generate_attn_hint, NPUW_LLM_GENERATE_ATTENTION_HINT, getString),
                           BIND(npuw::llm::shared_lm_head, NPUW_LLM_SHARED_HEAD, get),
+                          BIND(npuw::llm::propagate_slice_up, NPUW_LLM_PROPAGATE_SLICE_UP, get),
                           BIND(npuw::whisper::enabled, NPUW_WHISPER, get),
                           BIND(npuw::whisper::whisper_eos_token, NPUW_WHISPER_EOS_TOKEN, get),
                           BIND(npuw::whisper::whisper_decompose_sdpa, NPUW_WHISPER_DECOMPOSE_SDPA, get),
