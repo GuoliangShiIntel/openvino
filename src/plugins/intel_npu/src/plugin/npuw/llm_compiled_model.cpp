@@ -4,6 +4,7 @@
 #include "llm_compiled_model.hpp"
 
 #include <algorithm>
+#include <unordered_map>
 
 #include "embedding/embedding_infer_request.hpp"
 #include "embedding/encoder_embedding_infer_request.hpp"
@@ -33,6 +34,7 @@
 #include "npuw_transformations/shrink_sliding_window_kv_cache.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
+#include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
 #include "openvino/op/ops.hpp"
@@ -54,7 +56,10 @@
 #include "partitioning/patterns/pre_compute.hpp"
 #include "partitioning/patterns/sdpa.hpp"
 #include "serialization.hpp"
+#include "transformations/common_optimizations/convert_tiled_moe_block_to_gather_matmuls.hpp"
+#include "transformations/common_optimizations/moe_op_fusion.hpp"
 #include "transformations/convert_precision.hpp"
+#include "transformations/op_conversions/convert_gather_matmul_to_compressed.hpp"
 #include "util.hpp"
 #include "whisper/prepare_whisper_model.hpp"
 #include "whisper/whisper_infer_request.hpp"
@@ -581,7 +586,131 @@ void apply_moe_config(ov::AnyMap& stage_config,
                     "MoE DENSE mode requires CPU-only device (NPUW_DEVICES must be 'CPU'). "
                     "DENSE activates all experts simultaneously, causing extremely long NPU compilation time. "
                     "Please set NPUW_DEVICES to 'CPU'.");
+    } else if (moe_hint == ::intel_npu::npuw::llm::MoEHint::FUSED) {
+        // The expert subgraph was already collapsed into a single MOECompressed op earlier
+        // (see apply_moe_fusion), so no per-expert partitioning hints are needed here.
+        LOG_INFO("MoE config for " << stage_name
+                                   << " stage: FUSED (single MOECompressed op, device dynamic-sparse"
+                                      " kernel)");
+        // Workaround: a FUSED GENERATE blob compiled for more than 2 tiles hangs the device (DEVICE_LOST)
+        if (stage_name == "GENERATE") {
+            if (auto it = stage_config.find("NPU_TILES"); it != stage_config.end() && it->second.as<int64_t>() > 2) {
+                it->second = int64_t{2};
+            }
+        }
     }
+}
+
+// MoeOpFusion replaces the matched tiled-MoE block with a MOE(Compressed) node whose output rank
+// ([B,S,H]) can differ from the rank the original (unfused) block produced (e.g. flattened
+// [tokens,H]). Leftover Reshape ops right after the block - which existed to restore [B,S,H] from
+// that original rank and may carry stale/baked target values for it - no longer agree with the new
+// rank once ReshapeToStatic turns shapes concrete, and fail shape validation. Collapse such a
+// Reshape->Reshape pair into just the second Reshape: when its special_zero is false its output
+// shape depends only on its own target (not on the intermediate shape), so this is safe regardless
+// of the first reshape's target values, as long as it has no other consumers.
+class CollapseRedundantReshapePair : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("CollapseRedundantReshapePair");
+    CollapseRedundantReshapePair() {
+        using namespace ov::pass::pattern;
+        auto reshape_input = any_input();
+        auto reshape_a_target = any_input();
+        auto reshape_a = wrap_type<ov::op::v1::Reshape>({reshape_input, reshape_a_target}, consumers_count(1));
+        auto reshape_b_target = any_input();
+        auto reshape_b = wrap_type<ov::op::v1::Reshape>({reshape_a, reshape_b_target});
+
+        ov::matcher_pass_callback callback = [=](Matcher& m) {
+            const auto& pm = m.get_pattern_value_map();
+            auto reshape_b_node = ov::as_type_ptr<ov::op::v1::Reshape>(m.get_match_root());
+            if (!reshape_b_node || reshape_b_node->get_special_zero()) {
+                return false;
+            }
+            auto reshape_a_node = pm.at(reshape_a).get_node_shared_ptr();
+            auto new_reshape =
+                std::make_shared<ov::op::v1::Reshape>(pm.at(reshape_input), pm.at(reshape_b_target), false);
+            new_reshape->set_friendly_name(reshape_b_node->get_friendly_name());
+            ov::copy_runtime_info({reshape_a_node, reshape_b_node}, new_reshape);
+            ov::replace_node(reshape_b_node, new_reshape);
+            return true;
+        };
+        auto m = std::make_shared<Matcher>(reshape_b, "CollapseRedundantReshapePair");
+        register_matcher(m, callback);
+    }
+};
+
+// The fusion re-creates weight Constants as buffer-sharing reshapes without their weightless cache
+// attribute, which makes NPUW deep-copy every one of them. Same buffer means same file offset, so
+// put the attribute back on Constants which share a buffer with an original one.
+struct OriginalWeightAttr {
+    ov::WeightlessCacheAttribute attr;
+    std::size_t byte_size;
+};
+
+std::unordered_map<const void*, OriginalWeightAttr> collect_weightless_attrs(const std::shared_ptr<ov::Model>& model) {
+    std::unordered_map<const void*, OriginalWeightAttr> attrs;
+    for (const auto& op : model->get_ops()) {
+        auto c = ov::as_type_ptr<ov::op::v0::Constant>(op);
+        if (!c) {
+            continue;
+        }
+        const auto& rt_info = c->get_rt_info();
+        auto it = rt_info.find(ov::WeightlessCacheAttribute::get_type_info_static());
+        if (it != rt_info.end()) {
+            attrs.emplace(c->get_data_ptr(),
+                          OriginalWeightAttr{it->second.as<ov::WeightlessCacheAttribute>(), c->get_byte_size()});
+        }
+    }
+    return attrs;
+}
+
+void restore_weightless_attrs(const std::shared_ptr<ov::Model>& model,
+                              const std::unordered_map<const void*, OriginalWeightAttr>& attrs) {
+    for (const auto& op : model->get_ops()) {
+        auto c = ov::as_type_ptr<ov::op::v0::Constant>(op);
+        if (!c) {
+            continue;
+        }
+        auto& rt_info = c->get_rt_info();
+        if (rt_info.count(ov::WeightlessCacheAttribute::get_type_info_static())) {
+            continue;
+        }
+        auto it = attrs.find(c->get_data_ptr());
+        if (it != attrs.end() && it->second.byte_size == c->get_byte_size()) {
+            rt_info[ov::WeightlessCacheAttribute::get_type_info_static()] = it->second.attr;
+        }
+    }
+}
+
+// Collapse the decomposed tiled-MoE expert subgraph (Tile + batched MatMul + ScatterElementsUpdate
+// routing) into single MOE/MOECompressed ops, so the NPU compiler can lower each MoE block to a
+// single dynamic-sparse kernel instead of partitioning the unrolled expert graph.
+// Must run while the given model is still dynamic-shaped (before ReshapeToStatic): the
+// GatherMatmul-based pattern relies on dynamic per-token routing shapes and leaves stale
+// shape-compute chains if applied afterwards. Applied independently per stage (PREFILL /
+// GENERATE), since the kernel team may bring up FUSED support for one stage before the other.
+void apply_moe_fusion(const std::shared_ptr<ov::Model>& model) {
+    LOG_INFO("Fusing MoE expert subgraphs into MOECompressed ops (MoEHint::FUSED)");
+    const std::vector<ov::element::Type> supported_weights_types{ov::element::u4,
+                                                                 ov::element::i4,
+                                                                 ov::element::u8,
+                                                                 ov::element::i8};
+    const std::vector<ov::element::Type> supported_activation_types{ov::element::f32, ov::element::f16};
+
+    const auto original_attrs = collect_weightless_attrs(model);
+
+    ov::pass::Manager manager("NPUW:MoEFusion");
+    manager.register_pass<ov::pass::ConvertTiledMoeBlockToGatherMatmuls>(supported_weights_types);
+    manager.register_pass<ov::pass::Validate>();
+    // No SupportsPredicate yet: accept every matched config until NPU kernel limits are finalized
+    // with the kernel team, then gate IC/OC/group_size here.
+    manager.register_pass<ov::pass::ConvertGatherMatmulToGatherMatmulCompressed>(supported_activation_types,
+                                                                                 supported_weights_types);
+    manager.register_pass<ov::pass::MoeOpFusion>();
+    manager.register_pass<CollapseRedundantReshapePair>();
+    manager.register_pass<ov::pass::Validate>();
+    manager.run_passes(model);
+    restore_weightless_attrs(model, original_attrs);
 }
 
 // Apply DEVICE_ROUTED MoE transformations to models
@@ -823,6 +952,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             m_cfg.update({{"NPUW_LLM_GENERATE_MOE_HINT", "DEVICE_ROUTED"}});
         }
     }
+    // Read once: FUSED is resolved independently per stage (PREFILL / GENERATE), since the kernel
+    // team may bring up dynamic-sparse single-op MoE support for one stage before the other.
+    const auto prefill_moe_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_MOE_HINT>();
+    const auto generate_moe_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_MOE_HINT>();
 
     // NB: PREFILL_HINT is now compatible with the PREFILL_CONFIG section, unlike for
     // the generate model they're not mutually exclusive
@@ -997,6 +1130,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     auto prefill_model = kvcache_model->clone();
     prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
 
+    // Must run on the still-dynamic clone, before ReshapeToStatic below: the GatherMatmul-based
+    // fusion pattern relies on dynamic per-token routing shapes and leaves stale shape-compute
+    // chains if applied after the model is forced static.
+    if (is_moe && prefill_moe_hint == ::intel_npu::npuw::llm::MoEHint::FUSED) {
+        apply_moe_fusion(prefill_model);
+    }
+
     m_kvcache_desc =
         KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim, max_generation_token_len};
 
@@ -1088,6 +1228,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     // A bidirectional encoder embedding model has no autoregressive generate step (no KV cache,
     // no single-token decode), so the seq_len=1 generate graph is invalid for it and must not be
     // built/compiled. Only the (whole-sequence) prefill model is used at inference time.
+    // kvcache_model is still dynamic here (prefill_model already branched off above), so fuse MoE
+    // in place before each generate variant is cloned off and reshaped to static.
+    if (is_moe && generate_moe_hint == ::intel_npu::npuw::llm::MoEHint::FUSED) {
+        apply_moe_fusion(kvcache_model);
+    }
     std::vector<std::shared_ptr<ov::Model>> generate_model_variants;
     if (!m_is_encoder_embedding) {
         generate_model_variants = create_generate_model_variants(kvcache_model, axes, whisper_lhs_seq_size);
@@ -1353,11 +1498,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     if (is_moe) {
         // Apply MoE configuration for prefill stage
-        const auto prefill_moe_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_MOE_HINT>();
         apply_moe_config(prefill_config, prefill_moe_hint, "PREFILL");
 
         // Apply MoE configuration for generate stage
-        const auto generate_moe_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_MOE_HINT>();
         apply_moe_config(generate_config, generate_moe_hint, "GENERATE");
 
         // Fold shape-compute chains (ShapeOf→Gather→Concat etc.) in the prefill model before
@@ -1396,10 +1539,6 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             kv_kache_storage_type == ov::element::i8 || kv_kache_storage_type == ov::element::u8;
         OPENVINO_ASSERT(!integer_kv_cache,
                         "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE cannot be combined with integer KV-cache precision.");
-        OPENVINO_ASSERT(!m_enable_prefix_caching,
-                        "NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE and NPUW_LLM_ENABLE_PREFIX_CACHING "
-                        "cannot be enabled simultaneously — this combination is not yet supported. "
-                        "Please disable one of the two options.");
         if (m_use_chunk_prefill && !m_is_embedding && (prefill_attn_hfa || prefill_attn_pyramid)) {
             const uint32_t block_size = static_cast<uint32_t>(m_prefill_chunk_size);
 
@@ -1433,6 +1572,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                "Ensure the model uses HFA or Pyramid attention pattern.");
             }
             m_is_block_kv_cache = true;
+            if (m_enable_prefix_caching && m_prefix_caching_block_size != m_prefill_chunk_size) {
+                // One cached block must map to exactly one KV pool block.
+                LOG_INFO("Prefix caching block size is adjusted to " << m_prefill_chunk_size
+                                                                     << " to match the KV cache block size");
+                m_prefix_caching_block_size = m_prefill_chunk_size;
+            }
         } else {
             LOG_WARN("NPUW_LLM_ENABLE_BLOCK_BASED_KV_CACHE=YES was requested but could not be applied. "
                      "Block-based KV cache requires: chunk prefill enabled, "
